@@ -26,7 +26,7 @@ abstract class HttpServer extends Server
     public $httpSocketName;
 
     /**
-     * @var integer HTTP服务监听商品
+     * @var integer HTTP服务监听端口
      */
     public $httpPort;
 
@@ -41,16 +41,62 @@ abstract class HttpServer extends Server
     public $templateEngine;
 
     /**
+     * 视图文件存储路径,您可以指定多个路径以便让框架载入.
+     * 数组顺序即加载顺序,当然,框架会自动将msf视图目录放在最后resolve.
+     *
+     * @var array
+     */
+    public $viewResolvePaths;
+    
+    /**
+     * Input类
+     * 通过继承 PG\MSF\Base\Input 来自定义，默认是 PG\MSF\Base\Input
+     * 可以在配置文件中修改，例如：
+     * 
+     * ```php
+     * 'http' => [
+     *     'input' => PG\MSF\Base\Input::class,
+     * ]
+     * ```
+     * @var Input
+     */
+    public $input;
+    
+    /**
+     * Output类
+     * 通过继承 PG\MSF\Base\Output 来自定义，默认是 PG\MSF\Base\Output
+     * 可以在配置文件中修改，例如：
+     * 
+     * ```php
+     * 'http' => [
+     *     'output' => PG\MSF\Base\Output::class,
+     * ]
+     * ```
+     * @var Output
+     */
+    public $output;
+
+    /**
      * HttpServer constructor.
      */
     public function __construct()
     {
         parent::__construct();
-        $view_dir = APP_DIR . '/Views';
-        if (!is_dir($view_dir)) {
-            writeln('App directory does not exist Views directory, please create.');
-            exit();
-        }
+        $this->initViewResolvePaths();
+    }
+
+    /**
+     * 初始化需要检索的视图目录,请在配置中指定http_server.view_paths数组.
+     * 如果未指定,系统默认会尝试加载app/Views目录,任何时候,框架都会加载$MSFSrcDir/Views下的视图.
+     */
+    protected function initViewResolvePaths()
+    {
+        $this->viewResolvePaths = $this->config->get('http_server.view_paths', [
+            APP_DIR.'/Views'
+        ]);
+
+        // 框架自带的视图目录.
+        $this->viewResolvePaths[] = $this->MSFSrcDir.'/Views';
     }
 
     /**
@@ -64,6 +110,14 @@ abstract class HttpServer extends Server
         $this->httpEnable     = $this->config->get('http_server.enable', true);
         $this->httpSocketName = $this->config['http_server']['socket'];
         $this->httpPort       = $this->config['http_server']['port'];
+        $this->input          = $this->config->get('http.input', Input::class);
+        if (is_array($this->input)) {
+            $this->input = $this->input['class'] ?? Input::class;
+        }
+        $this->output         = $this->config->get('http.output', Output::class);
+        if (is_array($this->output)) {
+            $this->output = $this->output['class'] ?? Output::class;
+        }
         return $this;
     }
 
@@ -84,7 +138,8 @@ abstract class HttpServer extends Server
             $this->onWorkerStart(null, null);
         } else {
             //开启一个http服务器
-            $this->server = new \swoole_http_server($this->httpSocketName, $this->httpPort);
+            $mode = $this->config->get('server.mode', SWOOLE_PROCESS);
+            $this->server = new \swoole_http_server($this->httpSocketName, $this->httpPort, $mode);
             $this->server->on('Start', [$this, 'onStart']);
             $this->server->on('WorkerStart', [$this, 'onWorkerStart']);
             $this->server->on('WorkerStop', [$this, 'onWorkerStop']);
@@ -95,6 +150,7 @@ abstract class HttpServer extends Server
             $this->server->on('ManagerStart', [$this, 'onManagerStart']);
             $this->server->on('ManagerStop', [$this, 'onManagerStop']);
             $this->server->on('request', [$this, 'onRequest']);
+            $this->server->on('Shutdown', [$this, 'onShutdown']);
             $set = $this->setServerSet();
             $set['daemonize'] = self::$daemonize ? 1 : 0;
             $this->server->set($set);
@@ -136,100 +192,151 @@ abstract class HttpServer extends Server
      */
     public function onRequest($request, $response)
     {
+        $this->requestId++;
         $error              = '';
-        $code               = 500;
-        $controllerInstance = null;
+        $httpCode           = 500;
+        $logId              = $this->genLogId($request);
+        $instance           = null;
         $this->route->handleHttpRequest($request);
+
+        // 构造请求日志对象
+        $PGLog            = clone getInstance()->log;
+        $PGLog->accessRecord['beginTime'] = microtime(true);
+        $PGLog->accessRecord['uri']       = $this->route->getPath() ?: '/';
+        $PGLog->logId     = $logId;
+        defined('SYSTEM_NAME') && $PGLog->channel = SYSTEM_NAME;
+        $PGLog->init();
+        $PGLog->pushLog('verb', $this->route->getVerb());
+        $PGLog->pushLog('user-agent', $request->header['user-agent'] ?? 'unknown');
+        $PGLog->pushLog('remote-addr', self::getRemoteAddr($request));
 
         do {
             if ($this->route->getPath() == '') {
-                $error = 'Index not found';
-                $code  = 404;
-                break;
+                $indexFile = $this->route->domainRoot[$this->route->getHost()]['index'] ?? null;
+                $response->header('X-Ngx-LogId', $PGLog->logId);
+                $httpCode  = $this->sendFile($indexFile, $request, $response);
+                $PGLog->pushLog('http-code', $httpCode);
+                $PGLog->appendNoticeLog();
+                return;
+            }
+
+            if ($this->route->getFile()) {
+                $response->header('X-Ngx-LogId', $PGLog->logId);
+                $httpCode  = $this->sendFile($this->route->getFile(), $request, $response);
+                $PGLog->pushLog('http-code', $httpCode);
+                $PGLog->appendNoticeLog();
+                return;
             }
 
             $controllerName      = $this->route->getControllerName();
             $controllerClassName = $this->route->getControllerClassName();
             if ($controllerClassName == '') {
-                $error = 'Api not found controller(' . $controllerName . ')';
-                $code  = 404;
+                $error    = 'Api not found controller(' . $controllerName . ')';
+                $httpCode = 404;
                 break;
             }
 
-            $methodPrefix = $this->config->get('http.method_prefix', 'action');
+            $methodPrefix = $this->route->methodPrefix;
             $methodName   = $methodPrefix . $this->route->getMethodName();
 
             try {
                 /**
-                 * @var \PG\MSF\Controllers\Controller $controllerInstance
+                 * @var \PG\MSF\Controllers\Controller $instance
                  */
-                $controllerInstance = $this->objectPool->get($controllerClassName, [$controllerName, $methodName]);
-                $controllerInstance->__useCount++;
-                if (empty($controllerInstance->getObjectPool())) {
-                    $controllerInstance->setObjectPool(AOPFactory::getObjectPool(getInstance()->objectPool, $controllerInstance));
+                $instance = $this->objectPool->get($controllerClassName, [$controllerName, $methodName]);
+                $instance->__useCount++;
+                if (empty($instance->getObjectPool())) {
+                    $instance->setObjectPool(AOPFactory::getObjectPool(getInstance()->objectPool, $instance));
                 }
 
-                if (!method_exists($controllerInstance, $methodName)) {
-                    $error = 'Api not found method(' . $methodName . ')';
-                    $code  = 404;
+                if (!method_exists($instance, $methodName)) {
+                    $error    = 'Api not found method(' . $methodName . ')';
+                    $httpCode = 404;
                     break;
                 }
 
-                $controllerInstance->context = $controllerInstance->getObjectPool()->get(Context::class);
-
+                $instance->context = $instance->getObjectPool()->get(Context::class, [$this->requestId]);
                 // 初始化控制器
-                $controllerInstance->requestStartTime = microtime(true);
-                $PGLog            = null;
-                $PGLog            = clone getInstance()->log;
-                $PGLog->accessRecord['beginTime'] = $controllerInstance->requestStartTime;
-                $PGLog->accessRecord['uri']       = $this->route->getPath();
-                $PGLog->logId = $this->genLogId($request);
-                defined('SYSTEM_NAME') && $PGLog->channel = SYSTEM_NAME;
-                $PGLog->init();
-                $PGLog->pushLog('controller', $controllerName);
-                $PGLog->pushLog('method', $methodName);
-                $PGLog->pushLog('verb', $this->route->getVerb());
+                $instance->requestStartTime = microtime(true);
 
                 // 构造请求上下文成员
-                $controllerInstance->context->setLogId($PGLog->logId);
-                $controllerInstance->context->setLog($PGLog);
-                $controllerInstance->context->setObjectPool($controllerInstance->getObjectPool());
+                $instance->context->setLogId($PGLog->logId);
+                $instance->context->setLog($PGLog);
+                $instance->context->setObjectPool($instance->getObjectPool());
 
                 /**
                  * @var $input Input
                  */
-                $input    = $controllerInstance->context->getObjectPool()->get(Input::class);
+                $input    = $instance->context->getObjectPool()->get($this->input);
                 $input->set($request);
                 /**
                  * @var $output Output
                  */
-                $output   = $controllerInstance->context->getObjectPool()->get(Output::class, [$controllerInstance]);
+                $output   = $instance->context->getObjectPool()->get($this->output, [$instance]);
                 $output->set($request, $response);
 
-                $controllerInstance->context->setInput($input);
-                $controllerInstance->context->setOutput($output);
-                $controllerInstance->context->setControllerName($controllerName);
-                $controllerInstance->context->setActionName($methodName);
-                $controllerInstance->setRequestType(Marco::HTTP_REQUEST);
-                $init = $controllerInstance->__construct($controllerName, $methodName);
+                $instance->context->setInput($input);
+                $instance->context->setOutput($output);
+                $instance->context->setControllerName($controllerName);
+                $instance->context->setActionName($methodName);
+                $instance->setRequestType(Macro::HTTP_REQUEST);
+                $init = $instance->__construct($controllerName, $methodName);
 
                 if ($init instanceof \Generator) {
                     $this->scheduler->start(
                         $init,
-                        $controllerInstance->context,
-                        $controllerInstance,
-                        function () use ($controllerInstance, $methodName) {
-                            $generator = $controllerInstance->$methodName(...array_values($this->route->getParams()));
-                            if ($generator instanceof \Generator) {
-                                $this->scheduler->taskMap[$controllerInstance->context->getLogId()]->resetRoutine($generator);
-                                $this->scheduler->schedule($this->scheduler->taskMap[$controllerInstance->context->getLogId()]);
+                        $instance,
+                        function () use ($instance, $methodName) {
+                            try {
+                                if ($instance->getContext()->getOutput()->__isEnd) {
+                                    $instance->destroy();
+                                    return false;
+                                }
+
+                                $generator = $instance->$methodName(...array_values($this->route->getParams()));
+                                if ($generator instanceof \Generator) {
+                                    $this->scheduler->taskMap[$instance->context->getRequestId()]->resetRoutine($generator);
+                                    $this->scheduler->schedule(
+                                        $this->scheduler->taskMap[$instance->context->getRequestId()],
+                                        function () use ($instance) {
+                                            if (!$instance->getContext()->getOutput()->__isEnd) {
+                                                $instance->getContext()->getOutput()->output('Not Implemented', 501);
+                                            }
+                                            $instance->destroy();
+                                        }
+                                    );
+                                } else {
+                                    if (!$instance->getContext()->getOutput()->__isEnd) {
+                                        $instance->getContext()->getOutput()->output('Not Implemented', 501);
+                                    }
+                                    $instance->destroy();
+                                }
+                            } catch (\Throwable $e) {
+                                if (!$instance->getContext()->getOutput()->__isEnd) {
+                                    $instance->onExceptionHandle($e);
+                                }
+                                $instance->destroy();
                             }
                         }
                     );
                 } else {
-                    $generator = $controllerInstance->$methodName(...array_values($this->route->getParams()));
+                    $generator = $instance->$methodName(...array_values($this->route->getParams()));
                     if ($generator instanceof \Generator) {
-                        $this->scheduler->start($generator, $controllerInstance->context, $controllerInstance);
+                        $this->scheduler->start(
+                            $generator,
+                            $instance,
+                            function () use ($instance) {
+                                if (!$instance->getContext()->getOutput()->__isEnd) {
+                                    $instance->getContext()->getOutput()->output('Not Implemented', 501);
+                                }
+                                $instance->destroy();
+                            }
+                        );
+                    } else {
+                        if (!$instance->getContext()->getOutput()->__isEnd) {
+                            $instance->getContext()->getOutput()->output('Not Implemented', 501);
+                        }
+                        $instance->destroy();
                     }
                 }
 
@@ -241,18 +348,50 @@ abstract class HttpServer extends Server
                 }
                 break;
             } catch (\Throwable $e) {
-                $controllerInstance->onExceptionHandle($e);
+                $instance->onExceptionHandle($e);
+                $instance->destroy();
             }
         } while (0);
 
         if ($error !== '') {
-            if ($controllerInstance != null) {
-                $controllerInstance->destroy();
+            if ($instance != null) {
+                $instance->destroy();
             }
 
-            $response->status($code);
+            $PGLog->pushLog('http-code', $httpCode);
+            $PGLog->appendNoticeLog();
+            $response->status($httpCode);
             $response->end($error);
         }
+    }
+
+    /**
+     * 获取远程客户端IP
+     * 优先获取负载器转发ip
+     * @param \swoole_http_request $request 请求对象
+     * @return string
+     */
+    public static function getRemoteAddr($request)
+    {
+        $ip = $request->header['x-forwarded-for']       ??
+            $request->header['http_x_forwarded_for']    ??
+            $request->header['http_forwarded']          ??
+            $request->header['http_forwarded_for']      ??
+            '';
+
+        if ($ip) {
+            $ip = explode(',', $ip);
+            $ip = trim($ip[0]);
+            return $ip;
+        }
+
+        $ip = $request->header['http_client_ip']        ??
+            $request->header['x-real-ip']               ??
+            $request->header['remote_addr']             ??
+            $request->server['remote_addr']             ??
+            '';
+
+        return $ip;
     }
 
     /**
@@ -266,10 +405,11 @@ abstract class HttpServer extends Server
         static $i = 0;
         $i || $i = mt_rand(1, 0x7FFFFF);
 
-        $logId = $request->header['log_id'] ?? '' ;
+        $logId = $request->header['x-ngx-logid'] ?? $request->header['log_id'] ?? '' ;
 
         if (!$logId) {
-            $logId = sprintf("%08x%06x%04x%06x",
+            $logId = sprintf(
+                "%08x%06x%04x%06x",
                 time() & 0xFFFFFFFF,
                 crc32(substr((string)gethostname(), 0, 256)) >> 8 & 0xFFFFFF,
                 getmypid() & 0xFFFF,
@@ -278,5 +418,72 @@ abstract class HttpServer extends Server
         }
 
         return $logId;
+    }
+
+    /**
+     * 直接响应静态文件
+     *
+     * @param string $path
+     * @param \swoole_http_request $request 请求对象
+     * @param \swoole_http_response $response 响应对象
+     * @return int
+     */
+    public function sendFile($path, $request, $response)
+    {
+        if (empty($path)) {
+            $path = __DIR__ . '/Views/index.html';
+            if (!$response->sendfile($path)) {
+                swoole_async_readfile($path, function ($filename, $content) use ($response) {
+                    $response->end($content);
+                });
+            }
+
+            return Macro::SEND_FILE_200;
+        }
+
+        $path = realpath(urldecode($path));
+        $root = $this->config['http']['domain'][$this->route->getHost()]['root'] ?? null;
+
+        // 判断文件是否存在
+        if (!file_exists($path)) {
+            $response->status(404);
+            $response->end('');
+            return Macro::SEND_FILE_404;
+        }
+
+        // 判断文件是否有权限（非root目录不能访问）
+        if (empty($root) || strpos($path, $root) === false) {
+            $response->status(403);
+            $response->end('');
+            return Macro::SEND_FILE_403;
+        }
+
+        $info      = pathinfo($path);
+        $extension = strtolower($info['extension'] ?? '');
+
+        // 判断缓存
+        $lastModified = gmdate('D, d M Y H:i:s', filemtime($path)) . ' GMT';
+        if (isset($request->header['if-modified-since']) && $request->header['if-modified-since'] == $lastModified) {
+            $response->status(304);
+            $response->end('');
+            return Macro::SEND_FILE_304;
+        }
+
+        $normalHeaders = getInstance()->config->get("fileHeader.normal", ['Content-Type: application/octet-stream']);
+        $headers       = getInstance()->config->get("fileHeader.$extension", $normalHeaders);
+
+        foreach ($headers as $value) {
+            list($hk, $hv) = explode(': ', $value);
+            $response->header($hk, $hv);
+        }
+
+        $response->header('Last-Modified', $lastModified);
+        if (!$response->sendfile($path)) {
+            swoole_async_readfile($path, function ($filename, $content) use ($response) {
+                $response->end($content);
+            });
+        }
+
+        return Macro::SEND_FILE_200;
     }
 }

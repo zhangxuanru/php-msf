@@ -8,10 +8,10 @@
 
 namespace PG\MSF\Client\Http;
 
-use Exception;
 use PG\MSF\Base\Core;
 use PG\MSF\Coroutine\Dns;
 use PG\MSF\Coroutine\Http;
+use PG\MSF\Client\Exception;
 
 /**
  * Class Client
@@ -35,6 +35,21 @@ class Client extends Core
     public static $dnsCache = [];
 
     /**
+     * @var int keep-alive有效时间(秒)
+     */
+    protected static $keepAliveExpire = 120;
+
+    /**
+     * @var int keep-alive有效次数
+     */
+    protected static $keepAliveTimes = 10000;
+
+    /**
+     * @var array http keep-alive cache HTTP Client长连接缓存
+     */
+    public static $keepAliveCache = [];
+
+    /**
      * @var array 请求报头
      */
     public $headers;
@@ -47,7 +62,7 @@ class Client extends Core
     /**
      * @var array 解析的URL结果
      */
-    public $urlData;
+    public $urlData = [];
 
     /**
      * @var int DNS解析超时时间
@@ -58,9 +73,12 @@ class Client extends Core
      * Client constructor.
      *
      * @param string $url 如http://domain.com:port，http://domain.com:port/path/
-     * @param int $timeout 域名解析超时时间，单位秒
+     * @param int $timeout 域名解析超时时间，单位毫秒
      * @param array $headers 请求报头
-     * @return Client $this
+     *
+     * @return self
+     *
+     * @throws Exception 给定的url解析失败.
      */
     public function __construct($url = '', $timeout = 0, $headers = [])
     {
@@ -69,17 +87,34 @@ class Client extends Core
         }
 
         if (!empty($url)) {
-            $this->urlData = self::parseUrl($url);
+            $data = self::parseUrl($url);
+            if ($data === false) {
+                throw new Exception('url parse error, please check you url.');
+            }
+            $this->urlData = $data;
         }
 
         if ($timeout) {
             $this->dnsTimeout = $timeout;
         }
 
-        self::$dnsExpire = $this->getConfig()->get('http.dns.expire', 60);
-        self::$dnsTimes  = $this->getConfig()->get('http.dns.times', 10000);
+        self::$dnsExpire       = $this->getConfig()->get('http.dns.expire', 60);
+        self::$dnsTimes        = $this->getConfig()->get('http.dns.times', 10000);
+        self::$keepAliveExpire = $this->getConfig()->get('http.keepAlive.expire', 120);
+        self::$keepAliveTimes  = $this->getConfig()->get('http.keepAlive.times', 10000);
 
         return $this;
+    }
+
+    /**
+     * __call魔术方法
+     *
+     * @param $name
+     * @param $arguments
+     */
+    public function __call($name, $arguments)
+    {
+        return $this->client->{$name}(...$arguments);
     }
 
     /**
@@ -142,13 +177,13 @@ class Client extends Core
         if ($ip !== null) {
             $this->dnsLookupCallBack($ip);
         } else {
-            $logId = $this->getContext()->getLogId();
-            swoole_async_dns_lookup($this->urlData['host'], function ($host, $ip) use ($logId) {
+            $requestId = $this->getContext()->getRequestId();
+            swoole_async_dns_lookup($this->urlData['host'], function ($host, $ip) use ($requestId) {
                 if ($ip === '127.0.0.0') { // fix bug
                     $ip = '127.0.0.1';
                 }
 
-                if (empty(getInstance()->scheduler->taskMap[$logId])) {
+                if (empty(getInstance()->scheduler->taskMap[$requestId])) {
                     return;
                 }
 
@@ -186,14 +221,12 @@ class Client extends Core
 
         $ip = Client::getDnsCache($this->urlData['host']);
         if ($ip !== null) {
-            // swoole_http_client手工析构有Segmentation fault，暂时直接new
-            //$client     = $this->getObject(\swoole_http_client::class, [$ip, $this->urlData['port'], $this->urlData['ssl']]);
-            $client     = new \swoole_http_client($ip, $this->urlData['port'], $this->urlData['ssl']);
-            $client->set(['timeout' => -1]);
-            $this->client = $client;
+            $this->client = $this->getHttpClient($this->urlData['host'], $ip, $this->urlData['port'], $this->urlData['ssl']);
+
             $headers = array_merge($headers, [
                 'Host'        => $this->urlData['host'],
                 'X-Ngx-LogId' => $this->getContext()->getLogId(),
+                'Accept-Encoding' => 'gzip,deflate'
             ]);
             $this->setHeaders($headers);
             return $this;
@@ -236,6 +269,35 @@ class Client extends Core
     }
 
     /**
+     * 在完成DNS查询的基础上，运行请求协程
+     *
+     * @param string $url 请求的URL
+     * @param array $data 请求数据
+     * @param int $timeout 请求超时时间
+     * @param array $headers 额外的报头
+     * @return Http
+     * @throws Exception
+     */
+    public function goExecute($url = '', $data = [], $timeout = 30000, $headers = [])
+    {
+        if (!($this->client instanceof \swoole_http_client)) {
+            throw new Exception('You must complete the DNS query first, Such as $client->goDnsLookup()');
+        }
+
+        if (empty($this->urlData)) {
+            $this->urlData = self::parseUrl($url);
+        } else {
+            if (!empty($url)) {
+                $this->urlData['path'] = $url;
+            }
+        }
+        $this->setHeaders($headers);
+        $sendPostReq  = $this->getObject(Http::class, [$this, 'EXECUTE', $this->urlData['path'], $data, $timeout]);
+
+        return $sendPostReq;
+    }
+
+    /**
      * 在完成DNS查询的基础上，运行GET请求协程
      *
      * @param string $url 请求的URL
@@ -260,9 +322,55 @@ class Client extends Core
         }
         $this->setHeaders($headers);
 
-        $sendGetReq  = $this->getObject(Http::class, [$this, 'GET', $this->urlData['path'], $query, $timeout]);
+        //支持直接在url之后带参数形式的GET请求
+        $q = '';
+        if (!empty($this->urlData['query'])) {
+            $q = ltrim($this->urlData['query'], '?');
+        }
+
+        if (!empty($query)) {
+            $q .= (empty($q) ? '' : '&') . http_build_query($query) ;
+        }
+
+        $sendGetReq  = $this->getObject(Http::class, [$this, 'GET', $this->urlData['path'], $q, $timeout]);
 
         return $sendGetReq;
+    }
+
+    /**
+     * 单个独立请求协程（自动完成DNS查询、获取数据）
+     *
+     * @param string $url 请求的URL
+     * @param array $data 请求数据
+     * @param int $timeout 请求超时时间
+     * @param array $headers 额外的报头
+     * @return Http
+     * @throws Exception
+     */
+    public function goSingleExecute($url = '', $data = [], $timeout = 30000, $headers = [])
+    {
+        if (empty($this->urlData)) {
+            $this->urlData = self::parseUrl($url);
+        } else {
+            if (!empty($url)) {
+                $this->urlData['path'] = $url;
+            }
+        }
+
+        yield $this->goDnsLookup();
+        $this->setHeaders($headers);
+
+        if (!empty($this->urlData['query'])) {
+            return yield $this->getObject(
+                Http::class,
+                [$this, 'EXECUTE', $this->urlData['path'] . $this->urlData['query'], $data, $timeout]
+            );
+        } else {
+            return yield $this->getObject(
+                Http::class,
+                [$this, 'EXECUTE', $this->urlData['path'], $data, $timeout]
+            );
+        }
     }
 
     /**
@@ -292,20 +400,30 @@ class Client extends Core
         yield $this->goDnsLookup();
         $this->setHeaders($headers);
 
-        return yield $this->getObject(Http::class, [$this, 'POST', $this->urlData['path'], $data, $timeout]);
+        if (!empty($this->urlData['query'])) {
+            return yield $this->getObject(
+                Http::class,
+                [$this, 'POST', $this->urlData['path'] . $this->urlData['query'], $data, $timeout]
+            );
+        } else {
+            return yield $this->getObject(
+                Http::class,
+                [$this, 'POST', $this->urlData['path'], $data, $timeout]
+            );
+        }
     }
 
     /**
      * 单个独立GET请求协程（自动完成DNS查询、获取数据）
      *
      * @param string $url 请求的URL
-     * @param array $query POST的数据
+     * @param array $query GET的数据
      * @param int $timeout 请求超时时间
      * @param array $headers 额外的报头
      * @return Http
      * @throws Exception
      */
-    public function goSingleGet($url = '', $query = null, $timeout = 30000, $headers = [])
+    public function goSingleGet($url = '', $query = [], $timeout = 30000, $headers = [])
     {
         if (empty($this->urlData)) {
             $this->urlData = self::parseUrl($url);
@@ -318,7 +436,17 @@ class Client extends Core
         yield $this->goDnsLookup();
         $this->setHeaders($headers);
 
-        return yield $this->getObject(Http::class, [$this, 'GET', $this->urlData['path'], $query, $timeout]);
+        //支持直接在url之后带参数形式的GET请求
+        $q = '';
+        if (!empty($this->urlData['query'])) {
+            $q = ltrim($this->urlData['query'], '?');
+        }
+
+        if (!empty($query)) {
+            $q .= (empty($q) ? '' : '&') . http_build_query($query) ;
+        }
+
+        return yield $this->getObject(Http::class, [$this, 'GET', $this->urlData['path'], $q, $timeout]);
     }
 
     /**
@@ -456,6 +584,9 @@ class Client extends Core
             }
 
             if ($requests[$key]['method'] == 'GET') {
+                if (is_array($requests[$key]['data'])) {
+                    $requests[$key]['data'] = http_build_query($requests[$key]['data']);
+                }
                 $sendHttpRequests[$key] = $this->getObject(Http::class, [$client, 'GET', $client->urlData['path'], $requests[$key]['data'], $requests[$key]['timeout']]);
             }
 
@@ -486,11 +617,12 @@ class Client extends Core
 
         // swoole_http_client手工析构有Segmentation fault，暂时直接new
         //$this->client = $this->getObject(\swoole_http_client::class, [$ip, $this->urlData['port'], $this->urlData['ssl']]);
-        $this->client = new \swoole_http_client($ip, $this->urlData['port'], $this->urlData['ssl']);
-        $this->client->set(['timeout' => -1]);
+        $this->client = $this->getHttpClient($this->urlData['host'], $ip, $this->urlData['port'], $this->urlData['ssl']);
+
         $headers = array_merge($this->urlData['headers'], [
             'Host' => $this->urlData['host'],
             'X-Ngx-LogId' => $this->context->getLogId(),
+            'Accept-Encoding' => 'gzip,deflate'
         ]);
 
         $this->setHeaders($headers);
@@ -553,13 +685,13 @@ class Client extends Core
      * 发起异步GET请求
      *
      * @param string $path 待请求的URL Path
-     * @param array $query 查询参数
+     * @param string $query 查询参数
      * @param $callback
      */
-    public function get($path, $query, $callback)
+    public function get($path, string $query, $callback)
     {
         if (!empty($query)) {
-            $path = $path . "?" . http_build_query($query);
+            $path = $path . '?' . $query;
         }
         $this->client->get($path, $callback);
     }
@@ -580,6 +712,18 @@ class Client extends Core
         $this->client->post($path, $data, $callback);
     }
 
+
+    /**
+     * 发起异步请求
+     *
+     * @param string $path 待请求的URL Path
+     * @param $callback
+     */
+    public function execute($path, $callback)
+    {
+        $this->client->execute($path, $callback);
+    }
+
     /**
      * 设置DNS缓存
      *
@@ -596,7 +740,7 @@ class Client extends Core
     /**
      * 清除HOST对应的DNS缓存
      *
-     * @param $host HOST名称
+     * @param string $host HOST名称
      */
     public static function clearDnsCache($host)
     {
@@ -628,13 +772,74 @@ class Client extends Core
     }
 
     /**
+     * @param string $domain
+     * @param string $ip
+     * @param int $port
+     * @param $ssl
+     * @return mixed|null|\swoole_http_client
+     */
+    private function getHttpClient(string $domain, string $ip, int $port, $ssl)
+    {
+        $client = null;
+        if (self::$keepAliveExpire) {
+            $k = $domain . '|' . $ip . '|' . $port;
+            //是否创建新的http_client对象
+            $isCreate = true;
+            //存在队列
+            if (isset(self::$keepAliveCache[$k])) {
+                //队列里有http_client对象
+                while (!(self::$keepAliveCache[$k])->isEmpty() && $client = (self::$keepAliveCache[$k])->dequeue()) {
+                    //http_client对象有效
+                    if ($client->isConnected()) {
+                        $client->useCount++;
+                        $isCreate = false;
+                        break;
+                    } else {
+                        $client = null;
+                    }
+                }
+            } else {
+                //不存在队列
+                self::$keepAliveCache[$k] = new \SplQueue();
+            }
+
+            //新建http_client对象
+            if ($isCreate) {
+                $client = new \swoole_http_client($ip, $port, $ssl);
+                $client->set(['timeout' => -1, 'keep_alive' => 1]);
+                $client->useCount = 1;
+                $client->genTime  = time();
+                $client->isClose  = false;
+            }
+        } else {
+            $client = new \swoole_http_client($ip, $port, $ssl);
+            $client->set(['timeout' => -1]);
+        }
+        $client->ioBack = false;
+
+        return $client;
+    }
+
+    /**
      * 销毁
      */
     public function destroy()
     {
         parent::destroy();
         if ($this->client instanceof \swoole_http_client) {
-            $this->client->close();
+            if (isset($this->client->headers['connection']) &&
+                strlen($this->client->headers['connection']) === 10 && // 表示 Keep-Alive 长度为10
+                $this->client->ioBack  == true && $this->client->isClose == false &&
+                (time() - $this->client->genTime) < self::$keepAliveExpire &&
+                $this->client->useCount < self::$keepAliveTimes
+            ) {
+                //回收长连接
+                $k = $this->client->requestHeaders['Host'] . '|' . $this->client->host . '|' . $this->client->port;
+                (self::$keepAliveCache[$k])->enqueue($this->client);
+            } else {
+                //关闭连接
+                $this->client->close();
+            }
         }
     }
 }

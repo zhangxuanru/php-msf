@@ -8,7 +8,7 @@
 
 namespace PG\MSF;
 
-use Exception;
+use PG\MSF\Base\Exception;
 use Noodlehaus\Config;
 use PG\Log\PGLog;
 use PG\MSF\Base\Child;
@@ -30,7 +30,7 @@ abstract class Server extends Child
     /**
      * 版本
      */
-    const version = "3.0.0";
+    const version = "3.0.6";
 
     /**
      * 运行方式（web/console）
@@ -38,9 +38,9 @@ abstract class Server extends Child
     const mode = 'web';
 
     /**
-     * @var int 进程类型，worker,tasker,user
+     * @var int 进程类型
      */
-    public $processType = Marco::PROCESS_USER;
+    public $processType = Macro::PROCESS_MASTER;
 
     /**
      * @var Server 实例
@@ -165,6 +165,16 @@ abstract class Server extends Child
     public $objectPool;
 
     /**
+     * var array 进程内对象容器
+     */
+    public $objectPoolBuckets = [];
+
+    /**
+     * @var int 请求ID
+     */
+    public $requestId = 0;
+
+    /**
      * Server constructor.
      *
      * @throws Exception
@@ -218,34 +228,6 @@ abstract class Server extends Child
         $this->pack = new $packClassName;
     }
 
-    /**
-     * 创建用户自定义定时进程的上下文对象
-     *
-     * @return NULL|Context
-     */
-    public function getTimerContext()
-    {
-        $context = new Context();
-        $PGLog   = null;
-        $PGLog   = clone getInstance()->log;
-        $PGLog->accessRecord['beginTime'] = time();
-        $PGLog->accessRecord['uri']       = '/timerTick';
-        $PGLog->logId = $this->genLogId(null);
-        defined('SYSTEM_NAME') && $PGLog->channel = SYSTEM_NAME;
-        $PGLog->init();
-        $PGLog->pushLog('controller', 'timerTick');
-        $PGLog->pushLog('method', 'timerTick');
-
-        // 构造请求上下文成员
-        $context->setLogId($PGLog->logId);
-        $context->setLog($PGLog);
-        $context->setObjectPool(AOPFactory::getObjectPool(getInstance()->objectPool, $this));
-        $context->setControllerName('timerTick');
-        $context->setActionName('timerTick');
-        $this->setContext($context);
-
-        return $this->getContext();
-    }
     /**
      * 获取运行的Server实例
      *
@@ -326,6 +308,68 @@ abstract class Server extends Child
     }
 
     /**
+     * 停止当前worker.
+     *
+     * @param        $masterPid
+     * @param string $startFile
+     */
+    protected static function stopWorker($masterPid, $startFile = '')
+    {
+        @unlink(self::$pidFile);
+        writeln("$startFile is stoping ...");
+        // Send stop signal to master process.
+        $masterPid && posix_kill($masterPid, SIGTERM);
+        // Timeout.
+        $timeout = 5;
+        $startTime = time();
+        // Check master process is still alive?
+        while (1) {
+            $masterIsAlive = $masterPid && posix_kill($masterPid, SIG_BLOCK);
+            if ($masterIsAlive) {
+                // Timeout?
+                if (time() - $startTime >= $timeout) {
+                    writeln("{$startFile} stop fail");
+                    exit;
+                }
+                // Waiting amoment.
+                usleep(10000);
+                continue;
+            }
+            // Stop success.
+            writeln("{$startFile} stop success");
+            break;
+        }
+    }
+
+
+    /**
+     * 获取当前服务器的pid数据.包含俩个key:
+     * [
+     *      'masterPid' => 主进程pid.
+     *      'managerPid' => manager进程pid.
+     * ]
+     *
+     * @return array|bool 如果master活着则返回pid信息,否则返回false.
+     */
+    protected static function getServerPidInfo()
+    {
+        $masterPid = $managerPid = null;
+        if (file_exists(self::$pidFile)) {
+            $pids = explode(',', file_get_contents(self::$pidFile));
+            // Get master process PID.
+            $masterPid = $pids[0];
+            $managerPid = $pids[1];
+            $masterIsAlive = $masterPid && @posix_kill($masterPid, SIG_BLOCK);
+        } else {
+            $masterIsAlive = false;
+        }
+        return $masterIsAlive ? [
+            'masterPid' => $masterPid,
+            'managerPid' => $managerPid,
+        ] : false;
+    }
+
+    /**
      * 解析命令行参数
      *
      * @return void
@@ -343,19 +387,10 @@ abstract class Server extends Child
         $command = trim($argv[1]);
         $command2 = isset($argv[2]) ? $argv[2] : '';
 
-        // Start command.
-        $mode = '';
-        if (file_exists(self::$pidFile)) {
-            $pids = explode(',', file_get_contents(self::$pidFile));
-            // Get master process PID.
-            $masterPid = $pids[0];
-            $managerPid = $pids[1];
-            $masterIsAlive = $masterPid && @posix_kill($masterPid, SIG_BLOCK);
-        } else {
-            $masterIsAlive = false;
-        }
+        $pidInfo = static::getServerPidInfo();
+
         // Master is still alive?
-        if ($masterIsAlive) {
+        if ($pidInfo !== false) {
             if ($command === 'start' || $command === 'test') {
                 writeln("{$startFile} already running");
                 exit;
@@ -365,6 +400,9 @@ abstract class Server extends Child
             exit;
         }
 
+        $masterPid = $pidInfo['masterPid'];
+        $managerPid = $pidInfo['managerPid'];
+
         // execute command.
         switch ($command) {
             case 'start':
@@ -373,30 +411,7 @@ abstract class Server extends Child
                 }
                 break;
             case 'stop':
-                @unlink(self::$pidFile);
-                writeln("$startFile is stoping ...");
-                // Send stop signal to master process.
-                $masterPid && posix_kill($masterPid, SIGTERM);
-                // Timeout.
-                $timeout = 5;
-                $startTime = time();
-                // Check master process is still alive?
-                while (1) {
-                    $masterIsAlive = $masterPid && posix_kill($masterPid, SIG_BLOCK);
-                    if ($masterIsAlive) {
-                        // Timeout?
-                        if (time() - $startTime >= $timeout) {
-                            writeln("{$startFile} stop fail");
-                            exit;
-                        }
-                        // Waiting amoment.
-                        usleep(10000);
-                        continue;
-                    }
-                    // Stop success.
-                    writeln("{$startFile} stop success");
-                    break;
-                }
+                self::stopWorker($masterPid, $startFile);
                 exit(0);
                 break;
             case 'reload':
@@ -404,30 +419,7 @@ abstract class Server extends Child
                 writeln("{$startFile} reload");
                 exit;
             case 'restart':
-                @unlink(self::$pidFile);
-                writeln("{$startFile} is stoping ...");
-                // Send stop signal to master process.
-                $masterPid && posix_kill($masterPid, SIGTERM);
-                // Timeout.
-                $timeout = 5;
-                $startTime = time();
-                // Check master process is still alive?
-                while (1) {
-                    $masterIsAlive = $masterPid && posix_kill($masterPid, SIG_BLOCK);
-                    if ($masterIsAlive) {
-                        // Timeout?
-                        if (time() - $startTime >= $timeout) {
-                            writeln("{$startFile} stop fail");
-                            exit;
-                        }
-                        // Waiting amoment.
-                        usleep(10000);
-                        continue;
-                    }
-                    // Stop success.
-                    writeln("{$startFile} stop success");
-                    break;
-                }
+                self::stopWorker($masterPid, $startFile);
                 self::$daemonize = true;
                 break;
             case 'test':
@@ -477,15 +469,16 @@ abstract class Server extends Child
      */
     protected static function displayUI()
     {
+        global $argv;
         $setConfig = self::$_worker->setServerSet();
         $ascii     = file_get_contents(__DIR__ . '/../ascii.ui');
-        echo $ascii, "\n";
+        writeln("Start   Command: " . implode(" ", $argv) . "\n "  . $ascii);
         writeln('MSF     Version: ' . self::version);
         writeln('Swoole  Version: ' . SWOOLE_VERSION);
         writeln('PHP     Version: ' . PHP_VERSION);
         writeln('Application ENV: ' . APPLICATION_ENV);
-        writeln('Worker   Number: ' . $setConfig['worker_num']);
-        writeln('Task     Number: ' . $setConfig['task_worker_num'] ?? 0);
+        writeln('Worker   Number: ' . ($setConfig['worker_num'] ?? 0));
+        writeln('Task     Number: ' . ($setConfig['task_worker_num'] ?? 0));
         writeln("Listen     Addr: " . self::$_worker->config->get('http_server.socket'));
         writeln("Listen     Port: " . self::$_worker->config->get('http_server.port'));
     }
@@ -524,9 +517,10 @@ abstract class Server extends Child
     public function onStart($serv)
     {
         self::$_masterPid = $serv->master_pid;
+        $this->processType = Macro::PROCESS_MASTER;
         file_put_contents(self::$pidFile, self::$_masterPid);
         file_put_contents(self::$pidFile, ',' . $serv->manager_pid, FILE_APPEND);
-        self::setProcessTitle($this->config['server.process_title'] . '-Master');
+        self::setProcessTitle($this->config['server.process_title'] . '-' . Macro::PROCESS_NAME[$this->processType]);
     }
 
     /**
@@ -545,13 +539,12 @@ abstract class Server extends Child
             opcache_reset();
         }
 
-        file_put_contents(self::$pidFile, ',' . $serv->worker_pid, FILE_APPEND);
-        if (!$serv->taskworker) {//worker进程
+        file_put_contents(self::$pidFile, ',' . getmypid(), FILE_APPEND);
+        if ($this->processType != Macro::PROCESS_TASKER) {
             $this->scheduler = new Scheduler();
-            self::setProcessTitle($this->config['server.process_title'] . '-Worker');
-        } else {
-            self::setProcessTitle($this->config['server.process_title'] . '-Tasker');
         }
+
+        self::setProcessTitle($this->config['server.process_title'] . '-' . Macro::PROCESS_NAME[$this->processType]);
     }
 
     /**
@@ -640,7 +633,8 @@ abstract class Server extends Child
      */
     public function onManagerStart($serv)
     {
-        self::setProcessTitle($this->config['server.process_title'] . '-Manager');
+        $this->processType = Macro::PROCESS_MANAGER;
+        self::setProcessTitle($this->config['server.process_title'] . '-' . Macro::PROCESS_NAME[$this->processType]);
     }
 
     /**
@@ -649,6 +643,15 @@ abstract class Server extends Child
      * @param $serv
      */
     public function onManagerStop($serv)
+    {
+    }
+
+    /**
+     * 关闭服务
+     *
+     * @param $serv
+     */
+    public function onShutdown($serv)
     {
     }
 
@@ -665,18 +668,71 @@ abstract class Server extends Child
     }
 
     /**
+     * 添加定时器
      * 定时器包装（用于业务Timer进程）
      *
      * @param int $ms 定时器间隔毫秒
      * @param callable $callBack 定时器执行的回调
      * @param array $params 定时器其他参数
+     * @param string|callable $tickType 定时器类型，可选Macro::SWOOLE_TIMER_TICK，Macro::SWOOLE_TIMER_AFTER
+     * @throws Exception
      */
-    public function registerTimer($ms, callable $callBack, $params = [])
+    public function addTimer($ms, callable $callBack, $params = [], $tickType = Macro::SWOOLE_TIMER_TICK)
     {
-        swoole_timer_tick($ms, function ($timerId, $params) use ($callBack) {
-            $this->getTimerContext();
-            $callBack($timerId, $params);
-            $this->getContext()->getLog()->appendNoticeLog();
+        if (!in_array($tickType, ['swoole_timer_tick', 'swoole_timer_after'])) {
+            throw new Exception("not support $tickType tick type");
+        }
+
+        $tickType($ms, function ($timerId) use ($callBack, $params) {
+            $instance = false;
+            try {
+                $this->requestId++;
+                $methodName = $params['name'] ?? 'TimerTick';
+                $controllerName = 'TimerTick';
+                // 构造请求日志对象
+                $PGLog = clone getInstance()->log;
+                $PGLog->accessRecord['beginTime'] = microtime(true);
+                $PGLog->accessRecord['uri'] = '/' . $controllerName . '/' . $methodName;
+                $PGLog->logId = $this->genLogId(null);;
+                defined('SYSTEM_NAME') && $PGLog->channel = SYSTEM_NAME;
+                $PGLog->init();
+                $PGLog->pushLog('controller', $controllerName);
+                $PGLog->pushLog('method', $methodName);
+
+                /**
+                 * @var \PG\MSF\Controllers\Controller $instance
+                 */
+                $instance = $this->objectPool->get(\PG\MSF\Controllers\Controller::class,
+                    [$controllerName, $methodName]);
+                $instance->__useCount++;
+                if (empty($instance->getObjectPool())) {
+                    $instance->setObjectPool(AOPFactory::getObjectPool(getInstance()->objectPool, $instance));
+                }
+
+                $instance->context = $instance->getObjectPool()->get(Context::class, [$this->requestId]);
+                // 初始化控制器
+                $instance->requestStartTime = microtime(true);
+                $instance->context->setLogId($PGLog->logId);
+                $instance->context->setLog($PGLog);
+                $instance->context->setObjectPool($instance->getObjectPool());
+                $instance->context->setControllerName($controllerName);
+                $instance->context->setActionName($methodName);
+                $instance->__construct($controllerName, $methodName);
+
+                // 执行定时请求
+                $run = $callBack($instance, $timerId, $params);
+                if ($run instanceof \Generator) {
+                    $this->scheduler->start($run, $instance, function () use ($instance) {
+                        $instance->destroy();
+                    });
+                } else {
+                    $instance->destroy();
+                }
+            } catch (\Throwable $e) {
+                if ($instance) {
+                    $instance->destroy();
+                }
+            }
         }, $params);
     }
 
@@ -711,9 +767,9 @@ abstract class Server extends Child
      */
     public function checkErrors()
     {
-        if ($this->processType == Marco::PROCESS_WORKER) {
+        if ($this->processType == Macro::PROCESS_WORKER) {
             // exit统计
-            $key = Marco::SERVER_STATS . getInstance()->server->worker_id . '_exit';
+            $key = Macro::SERVER_STATS . getInstance()->server->worker_id . '_exit';
             $exitStat = $this->sysCache->get($key);
             if (!$exitStat) {
                 $exitStat = 1;
@@ -774,7 +830,7 @@ abstract class Server extends Child
      */
     public function isTaskWorker()
     {
-        return !empty($this->server) && $this->server->taskworker;
+        return !empty($this->server) && property_exists($this->server, 'taskworker') && $this->server->taskworker;
     }
 
     /**

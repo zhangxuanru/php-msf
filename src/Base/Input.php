@@ -31,7 +31,7 @@ class Input extends Core
      */
     public function __sleep()
     {
-        $this->__serializeRequest          = new \swoole_http_request();
+        $this->__serializeRequest          = new \stdClass();
         $this->__serializeRequest->get     = $this->request->get  ?? [];
         $this->__serializeRequest->post    = $this->request->post ?? [];
         $this->__serializeRequest->files   = $this->request->files ?? [];
@@ -118,12 +118,15 @@ class Input extends Core
     }
 
     /**
-     * 先获取所有的POST参数，如果POST为空则获取所有的Get参数
+     * 获取所有的POST参数和Get参数
      *
      * @return array
      */
     public function getAllPostGet()
     {
+        if (isset($this->request->post, $this->request->get)) {
+            return array_merge($this->request->get, $this->request->post);
+        }
         return $this->request->post ?? $this->request->get ?? [];
     }
 
@@ -305,20 +308,7 @@ class Input extends Core
      */
     public function getRemoteAddr()
     {
-        if (($ip = $this->getHeader('x-forwarded-for')) || ($ip = $this->getHeader('http_x_forwarded_for'))
-            || ($ip = $this->getHeader('http_forwarded')) || ($ip = $this->getHeader('http_forwarded_for'))
-            || ($ip = $this->getHeader('http_forwarded'))
-        ) {
-            $ip = explode(',', $ip);
-            $ip = trim($ip[0]);
-        } elseif ($ip = $this->getHeader('http_client_ip')) {
-        } elseif ($ip = $this->getHeader('x-real-ip')) {
-        } elseif ($ip = $this->getHeader('remote_addr')) {
-        } elseif ($ip = $this->request->server['remote_addr']) {
-            // todo
-        }
-
-        return $ip;
+        return getInstance()::getRemoteAddr($this->request);
     }
 
     /**

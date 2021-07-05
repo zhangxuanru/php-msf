@@ -8,14 +8,16 @@
 
 namespace PG\MSF\Base;
 
-use Exception;
 use Noodlehaus\Config;
 use PG\MSF\Pack\IPack;
 use PG\AOP\Wrapper;
+use PG\MSF\Pools\Miner;
 use PG\MSF\Pools\RedisAsynPool;
 use PG\MSF\Pools\MysqlAsynPool;
 use PG\MSF\Proxy\RedisProxyFactory;
+use PG\MSF\Proxy\MysqlProxyFactory;
 use PG\MSF\Pools\CoroutineRedisProxy;
+use PG\MSF\Proxy\MysqlProxyMasterSlave;
 
 /**
  * Class Core
@@ -24,7 +26,7 @@ use PG\MSF\Pools\CoroutineRedisProxy;
 class Core extends Child
 {
     /**
-     * @var int 作用计数
+     * @var int 使用计数
      */
     public $__useCount;
 
@@ -36,7 +38,7 @@ class Core extends Child
     /**
      * @var bool 是否执行构造方法
      */
-    public $__isContruct = false;
+    public $__isConstruct = false;
 
     /**
      * @var bool 销毁标志
@@ -54,21 +56,25 @@ class Core extends Child
     protected $redisPools;
 
     /**
+     * @var array redis代理池
+     */
+    protected $redisProxies;
+
+    /**
      * @var array mysql连接池
      */
     protected $mysqlPools;
 
     /**
-     * @var array redis代理池
+     * @var array mysql代理池
      */
-    protected $redisProxies;
+    protected $mysqlProxies;
 
     /**
      * 构造方法
      */
     public function __construct()
     {
-
     }
 
     /**
@@ -144,10 +150,40 @@ class Core extends Child
     }
 
     /**
+     * 获取Redis代理
+     *
+     * @param string $proxyName 配置的Redis代理名称
+     * @return bool|Wrapper|CoroutineRedisProxy|\Redis
+     * @throws Exception
+     */
+    public function getRedisProxy(string $proxyName)
+    {
+        if (isset($this->redisProxies[$proxyName])) {
+            return $this->redisProxies[$proxyName];
+        }
+
+        $proxy = getInstance()->getRedisProxy($proxyName);
+        if (!$proxy) {
+            $config = $this->getConfig()->get('redis_proxy.' . $proxyName, null);
+            if (!$config) {
+                throw new Exception("config redis_proxy.$proxyName not exits");
+            }
+            $proxy = RedisProxyFactory::makeProxy($proxyName, $config);
+            if (!$proxy) {
+                throw new Exception('make proxy failed, please check your proxy config.');
+            }
+            getInstance()->addRedisProxy($proxyName, $proxy);
+        }
+
+        $this->redisProxies[$proxyName] = AOPFactory::getRedisProxy($proxy, $this);
+        return $this->redisProxies[$proxyName];
+    }
+
+    /**
      * 获取MySQL连接池
      *
      * @param string $poolName 配置的MySQL连接池名称
-     * @return bool|Wrapper
+     * @return MysqlAsynPool|Miner|Wrapper
      */
     public function getMysqlPool(string $poolName)
     {
@@ -168,30 +204,33 @@ class Core extends Child
     }
 
     /**
-     * 获取Redis代理
+     * 获取Mysql代理
      *
-     * @param string $proxyName 配置的Redis代理名称
-     * @return bool|Wrapper|CoroutineRedisProxy|\Redis
+     * @param string $proxyName 配置的MySQL代理名称
+     * @return Wrapper|mysqlProxyMasterSlave|Miner|MysqlAsynPool
      * @throws Exception
      */
-    public function getRedisProxy(string $proxyName)
+    public function getMysqlProxy(string $proxyName)
     {
-        if (isset($this->redisProxies[$proxyName])) {
-            return $this->redisProxies[$proxyName];
+        if (isset($this->mysqlProxies[$proxyName])) {
+            return $this->mysqlProxies[$proxyName];
         }
 
-        $proxy = getInstance()->getRedisProxy($proxyName);
+        $proxy = getInstance()->getMysqlProxy($proxyName);
         if (!$proxy) {
-            $config = $this->getConfig()->get('redis_proxy.' . $proxyName, null);
+            $config = $this->getConfig()->get('mysql_proxy.' . $proxyName, null);
             if (!$config) {
-                throw new Exception("config redis_proxy.$proxyName not exits");
+                throw new Exception("config mysql_proxy.$proxyName not exits");
             }
-            $proxy = RedisProxyFactory::makeProxy($proxyName, $config);
-            getInstance()->addRedisProxy($proxyName, $proxy);
+            $proxy = MysqlProxyFactory::makeProxy($proxyName, $config);
+            if (!$proxy) {
+                throw new Exception('make proxy failed, please check your proxy config.');
+            }
+            getInstance()->addMysqlProxy($proxyName, $proxy);
         }
 
-        $this->redisProxies[$proxyName] = AOPFactory::getRedisProxy($proxy, $this);
-        return $this->redisProxies[$proxyName];
+        $this->mysqlProxies[$proxyName] = AOPFactory::getMysqlProxy($proxy, $this);
+        return $this->mysqlProxies[$proxyName];
     }
 
     /**

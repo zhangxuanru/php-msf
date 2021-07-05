@@ -9,7 +9,6 @@
 namespace PG\MSF\Helpers;
 
 use PG\Context\AbstractContext;
-use PG\Log\PGLog;
 use PG\MSF\Base\Input;
 use PG\MSF\Base\Output;
 use PG\MSF\Base\Pool;
@@ -52,6 +51,31 @@ class Context extends AbstractContext
      * @var array 存储自定义的全局上下文数据
      */
     protected $userDefined = [];
+
+    /**
+     * @var int 当前请求ID
+     */
+    protected $requestId;
+
+    /**
+     * Context constructor.
+     *
+     * @param $requestId int 请求ID
+     */
+    public function __construct($requestId)
+    {
+        $this->requestId = $requestId;
+    }
+
+    /**
+     * 返回当前请求ID
+     *
+     * @return int
+     */
+    public function getRequestId()
+    {
+        return $this->requestId;
+    }
 
     /**
      * 获取请求输入对象
@@ -204,7 +228,7 @@ class Context extends AbstractContext
      */
     public function __sleep()
     {
-        return ['logId', 'input', 'controllerName', 'actionName', 'userDefined'];
+        return ['logId', 'requestId', 'input', 'controllerName', 'actionName', 'userDefined'];
     }
 
     /**
@@ -219,5 +243,6 @@ class Context extends AbstractContext
         $this->controllerName = null;
         $this->actionName     = null;
         $this->userDefined    = [];
+        $this->requestId      = null;
     }
 }

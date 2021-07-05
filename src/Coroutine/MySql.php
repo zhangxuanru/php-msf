@@ -8,7 +8,6 @@
 
 namespace PG\MSF\Coroutine;
 
-use Exception;
 use PG\MSF\Pools\MysqlAsynPool;
 
 /**
@@ -45,15 +44,20 @@ class MySql extends Base
         $this->mysqlAsynPool = $_mysqlAsynPool;
         $this->bindId        = $_bind_id;
         $this->sql           = $_sql;
-        $this->request       = 'mysql(' . str_replace("\n", " ", $_sql) . ')';
-        $this->requestId     = $this->getContext()->getLogId();
+        $this->request       = $this->mysqlAsynPool->getAsynName() . '(' . str_replace("\n", " ", $_sql) . ')';
+        $this->requestId     = $this->getContext()->getRequestId();
+        $requestId           = $this->requestId;
 
         $this->getContext()->getLog()->profileStart($this->request);
         getInstance()->scheduler->IOCallBack[$this->requestId][] = $this;
         $keys            = array_keys(getInstance()->scheduler->IOCallBack[$this->requestId]);
         $this->ioBackKey = array_pop($keys);
 
-        $this->send(function ($result) {
+        $this->send(function ($result) use ($requestId) {
+            if (empty($this->getContext()) || ($requestId != $this->getContext()->getRequestId())) {
+                return;
+            }
+
             if ($this->isBreak) {
                 return;
             }
@@ -76,7 +80,7 @@ class MySql extends Base
      */
     public function send($callback)
     {
-        $this->mysqlAsynPool->query($this->getContext(), $callback, $this->bindId, $this->sql);
+        $this->mysqlAsynPool->query($callback, $this->bindId, $this->sql, $this->getContext());
     }
 
     /**
@@ -101,7 +105,7 @@ class MySql extends Base
      */
     public function __unsleep()
     {
-        return ['context', 'mysqlAsynPool'];
+        return ['mysqlAsynPool'];
     }
 
     /**

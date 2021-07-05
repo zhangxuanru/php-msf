@@ -53,14 +53,19 @@ class Http extends Base
         $this->method     = $method;
         $this->data       = $data;
         $profileName      = mt_rand(1, 9) . mt_rand(1, 9) . mt_rand(1, 9) . '#api-http://' . $this->client->urlData['host'] . ':' . $this->client->urlData['port'] . $this->path;
-        $this->requestId  = $this->getContext()->getLogId();
+        $this->requestId  = $this->getContext()->getRequestId();
+        $requestId        = $this->requestId;
 
         $this->getContext()->getLog()->profileStart($profileName);
         getInstance()->scheduler->IOCallBack[$this->requestId][] = $this;
         $keys = array_keys(getInstance()->scheduler->IOCallBack[$this->requestId]);
         $this->ioBackKey = array_pop($keys);
 
-        $this->send(function ($client) use ($profileName) {
+        $this->send(function ($client) use ($profileName, $requestId) {
+            if (empty($this->getContext()) || ($requestId != $this->getContext()->getRequestId())) {
+                return;
+            }
+
             if ($this->isBreak) {
                 return;
             }
@@ -69,16 +74,19 @@ class Http extends Base
                 return;
             }
 
-            $this->result       = (array)$client;
             // 发现拒绝建立连接，删除DNS缓存
             if (is_object($client) && ($client->errCode == 111 || $client->statusCode == 404)) {
                 Client::clearDnsCache($this->client->urlData['host']);
+                $client->isClose = true;
             }
 
             if (is_object($client) && $client->errCode != 0) {
                 $this->getContext()->getLog()->warning(dump($client, false, true));
+                $client->isClose = true;
             }
 
+            $client->ioBack     = true;
+            $this->result       = (array)$client;
             $this->responseTime = microtime(true);
             $this->getContext()->getLog()->profileEnd($profileName);
             $this->ioBack = true;
@@ -99,6 +107,12 @@ class Http extends Base
                 break;
             case 'GET':
                 $this->client->get($this->path, $this->data, $callback);
+                break;
+            case 'EXECUTE':
+                if (!empty($this->data)) {
+                    $this->client->setData($this->data);
+                }
+                $this->client->execute($this->path, $callback);
                 break;
         }
     }

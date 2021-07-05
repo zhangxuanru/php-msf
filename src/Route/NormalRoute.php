@@ -27,7 +27,7 @@ class NormalRoute implements IRoute
     /**
      * @var \stdClass 请求的路由相关信息
      */
-    protected $routePrams;
+    protected $routeParams;
 
     /**
      * @var string 控制器完全命名空间类名
@@ -35,61 +35,117 @@ class NormalRoute implements IRoute
     public $controllerClassName;
 
     /**
+     * @var string 默认控制器
+     */
+    public $defaultController = '';
+
+    /**
+     * @var string 默认控制器方法
+     */
+    public $defaultMethod = '';
+
+    /**
+     * @var string 网站根目录
+     */
+    public $domainRoot = '';
+
+    /**
+     * @var string 方法前缀
+     */
+    public $methodPrefix;
+
+    /**
      * NormalRoute constructor.
      */
     public function __construct()
     {
-        $this->routePrams = new \stdClass();
+        $this->routeParams       = new \stdClass();
+        $this->defaultController = getInstance()->config->get("http.default_controller", '');
+        $this->defaultMethod     = getInstance()->config->get('http.default_method', 'Index');
+        $this->domainRoot        = getInstance()->config->get('http.domain', []);
+        $this->methodPrefix      = getInstance()->config->get('http.method_prefix', 'action');
+    }
+
+    /**
+     * 解析HTTP请求的基础信息
+     *
+     * @param \swoole_http_request $request
+     * @return $this
+     */
+    public function parseRequestBase($request)
+    {
+        $this->routeParams->file  = '';
+        $host = $request->header['host'] ?? '';
+        if ($host) {
+            $host = explode(':', $host)[0] ?? '';
+        }
+        $this->routeParams->host = $host;
+        $this->routeParams->path = $this->defaultController ? $request->server['path_info'] : rtrim($request->server['path_info'], '/');
+        $this->routeParams->verb = $this->parseVerb($request);
+        $this->setParams($request->get ?? []);
+
+        return $this;
     }
 
     /**
      * HTTP请求解析
      *
-     * @param \swoole_http_client $request 请求对象
+     * @param \swoole_http_request $request 请求对象
      */
     public function handleHttpRequest($request)
     {
-        $this->routePrams->path = rtrim($request->server['path_info'], '/');
-        $this->routePrams->verb = $this->parseVerb($request);
-        $this->setParams($request->get ?? []);
+        $this->parseRequestBase($request);
 
         if (isset($request->header['x-rpc']) && $request->header['x-rpc'] == 1) {
-            $this->routePrams->isRpc          = true;
-            $this->routePrams->params         = $request->post ?? $request->get ?? [];
-            $this->routePrams->controllerName = 'Rpc';
-            $this->routePrams->methodName     = 'Index';
-            $this->controllerClassName        = '\PG\MSF\Controllers\Rpc';
-            $this->routePrams->path           = '/Rpc/Index';
+            $this->routeParams->isRpc          = true;
+            $this->routeParams->params         = $request->post ?? $request->get ?? [];
+            $this->routeParams->controllerName = 'Rpc';
+            $this->routeParams->methodName     = 'Index';
+            $this->controllerClassName         = '\PG\MSF\Controllers\Rpc';
+            $this->routeParams->path           = '/Rpc/Index';
         } else {
-            $this->parsePath($this->routePrams->path);
+            if ($this->routeParams->path) {
+                $this->parsePath($this->routeParams->path);
+            }
         }
     }
 
     /**
      * 计算Controller Class Name
      *
+     * @param bool $loadDefault 是否加载默认的控制器
      * @return bool
      */
-    public function findControllerClassName()
+    public function findControllerClassName($loadDefault = false)
     {
         $this->controllerClassName = '';
         do {
-            $className = "\\App\\Controllers\\" . $this->routePrams->controllerName;
+            $className = "\\App\\Controllers\\" . $this->routeParams->controllerName;
             if (class_exists($className)) {
                 $this->controllerClassName = $className;
                 break;
             }
 
-            $className = "\\PG\\MSF\\Controllers\\" . $this->routePrams->controllerName;
+            $className = "\\PG\\MSF\\Controllers\\" . $this->routeParams->controllerName;
             if (class_exists($className)) {
                 $this->controllerClassName = $className;
                 break;
             }
 
-            $className = "\\App\\Console\\" . $this->routePrams->controllerName;
+            $className = "\\App\\Console\\" . $this->routeParams->controllerName;
             if (class_exists($className)) {
                 $this->controllerClassName = $className;
                 break;
+            }
+
+            if ($loadDefault) {
+                if ($this->defaultController) {
+                    $className = "\\App\\Controllers\\" . $this->defaultController;
+                    if (class_exists($className)) {
+                        $this->controllerClassName = $className;
+                        break;
+                    }
+                }
             }
         } while (0);
 
@@ -109,10 +165,15 @@ class NormalRoute implements IRoute
     public function parsePath($path)
     {
         if ($this->getEnableCache() && isset($this->routeCache[$path])) {
-            $this->routePrams->controllerName = $this->routeCache[$path][0];
-            $this->routePrams->methodName     = $this->routeCache[$path][1];
-            $this->controllerClassName        = $this->routeCache[$path][2];
+            $this->routeParams->controllerName = $this->routeCache[$path][0];
+            $this->routeParams->methodName     = $this->routeCache[$path][1];
+            $this->controllerClassName         = $this->routeCache[$path][2];
         } else {
+            if (stristr($path, '.')) {
+                $this->routeParams->file = ($this->domainRoot[$this->getHost()]['root'] ?? ROOT_PATH . '/www') . $path;
+                return true;
+            }
+
             $route = explode('/', ltrim($path, '/'));
             $route = array_map(function ($name) {
                 if (strpos($name, '-') !== false) { // 中横线模式处理.
@@ -129,22 +190,23 @@ class NormalRoute implements IRoute
             if (count($route) > 1) {
                 $methodName = array_pop($route);
             } else {
-                $methodName = getInstance()->config->get('http.default_method', 'Index');
+                $methodName = $this->defaultMethod;
             }
-            $this->routePrams->controllerName = ltrim(implode("\\", $route), "\\") ?? null;
-            $this->routePrams->methodName     = $methodName;
-            $this->controllerClassName        = '';
+            $this->routeParams->controllerName = ltrim(implode("\\", $route), "\\") ?? null;
+            $this->routeParams->methodName     = $methodName;
+            $this->controllerClassName         = '';
 
             if ($this->findControllerClassName()) {
                 return true;
             }
 
-            $methodDefault  = getInstance()->config->get('http.default_method', 'Index');
-            $controllerName = $this->routePrams->controllerName  . "\\" . $this->getMethodName();
+            $controllerName = empty($this->routeParams->controllerName)
+                ? $this->getMethodName()
+                : $this->routeParams->controllerName . "\\" . $this->getMethodName();
             $this->setControllerName($controllerName);
-            $this->setMethodName($methodDefault);
+            $this->setMethodName($this->defaultMethod);
 
-            if ($this->findControllerClassName()) {
+            if ($this->findControllerClassName(true)) {
                 return true;
             }
 
@@ -177,7 +239,7 @@ class NormalRoute implements IRoute
      */
     public function getControllerName()
     {
-        return $this->routePrams->controllerName;
+        return $this->routeParams->controllerName ?? '';
     }
 
     /**
@@ -187,7 +249,7 @@ class NormalRoute implements IRoute
      */
     public function getControllerClassName()
     {
-        return $this->controllerClassName;
+        return $this->controllerClassName ?? '';
     }
 
     /**
@@ -197,7 +259,7 @@ class NormalRoute implements IRoute
      */
     public function getMethodName()
     {
-        return $this->routePrams->methodName;
+        return $this->routeParams->methodName ?? '';
     }
 
     /**
@@ -207,8 +269,41 @@ class NormalRoute implements IRoute
      */
     public function getPath()
     {
-        return $this->routePrams->path;
+        return $this->routeParams->path ?? '';
     }
+
+    /**
+     * 获取静态文件路径
+     *
+     * @return string
+     */
+    public function getFile()
+    {
+        return $this->routeParams->file ?? '';
+    }
+
+    /**
+     * 设置静态文件路径
+     *
+     * @param string $file 静态文件路径
+     * @return $this
+     */
+    public function setFile($file)
+    {
+        $this->routeParams->file = $file;
+        return $this;
+    }
+
+    /**
+     * 获取请求报头的Host
+     *
+     * @return string
+     */
+    public function getHost()
+    {
+        return $this->routeParams->host ?? '';
+    }
+
 
     /**
      * 判断请求是否为RPC请求
@@ -217,7 +312,7 @@ class NormalRoute implements IRoute
      */
     public function getIsRpc()
     {
-        return $this->routePrams->isRpc ?? false;
+        return $this->routeParams->isRpc ?? false;
     }
 
     /**
@@ -227,7 +322,7 @@ class NormalRoute implements IRoute
      */
     public function getVerb()
     {
-        return $this->routePrams->verb ?? null;
+        return $this->routeParams->verb ?? null;
     }
 
     /**
@@ -237,7 +332,7 @@ class NormalRoute implements IRoute
      */
     public function getParams()
     {
-        return $this->routePrams->params ?? [];
+        return $this->routeParams->params ?? [];
     }
 
     /**
@@ -248,7 +343,7 @@ class NormalRoute implements IRoute
      */
     public function setControllerName($name)
     {
-        $this->routePrams->controllerName = $name;
+        $this->routeParams->controllerName = $name;
         return $this;
     }
 
@@ -260,7 +355,7 @@ class NormalRoute implements IRoute
      */
     public function setMethodName($name)
     {
-        $this->routePrams->methodName = $name;
+        $this->routeParams->methodName = $name;
         return $this;
     }
 
@@ -272,7 +367,7 @@ class NormalRoute implements IRoute
      */
     public function setParams($params)
     {
-        $this->routePrams->params = $params;
+        $this->routeParams->params = $params;
         return $this;
     }
 

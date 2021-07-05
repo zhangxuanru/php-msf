@@ -9,7 +9,7 @@
 namespace PG\MSF\Coroutine;
 
 use PG\MSF\Pools\RedisAsynPool;
-use PG\MSF\Marco;
+use PG\MSF\Macro;
 
 /**
  * Class Redis
@@ -70,15 +70,19 @@ class Redis extends Base
         $this->redisSerialize = $redisAsynPool->redisSerialize;
         $this->name           = $name;
         $this->arguments      = $arguments;
-        $this->request        = mt_rand(1, 9) . mt_rand(1, 9) . mt_rand(1, 9) . "#redis.$name";
-        $this->requestId      = $this->getContext()->getLogId();
+        $this->request        = mt_rand(1, 9) . mt_rand(1, 9) . mt_rand(1, 9) .  '#' . $this->redisAsynPool->getAsynName()  . '.' . $name;
+        $this->requestId      = $this->getContext()->getRequestId();
+        $requestId            = $this->requestId;
 
         $this->getContext()->getLog()->profileStart($this->request);
         getInstance()->scheduler->IOCallBack[$this->requestId][] = $this;
         $keys            = array_keys(getInstance()->scheduler->IOCallBack[$this->requestId]);
         $this->ioBackKey = array_pop($keys);
 
-        $this->send(function ($result) use ($name) {
+        $this->send(function ($result) use ($name, $requestId) {
+            if (empty($this->getContext()) || ($requestId != $this->getContext()->getRequestId())) {
+                return;
+            }
             if ($this->isBreak) {
                 return;
             }
@@ -90,7 +94,7 @@ class Redis extends Base
             $this->getContext()->getLog()->profileEnd($this->request);
 
             switch ($name) {
-                case 'mget';
+                case 'mget':
                     $keys = $this->arguments[0];
                     $len = strlen($this->keyPrefix);
                     $result = $this->unSerializeHandler($result, $keys, $len);
@@ -207,12 +211,12 @@ class Redis extends Base
         //get
         if (is_string($data) && $this->redisSerialize) {
             switch ($this->redisSerialize) {
-                case Marco::SERIALIZE_PHP:
+                case Macro::SERIALIZE_PHP:
                     if ($this->canUnserialize($data)) {
                         $data = unserialize($data);
                     }
                     break;
-                case Marco::SERIALIZE_IGBINARY:
+                case Macro::SERIALIZE_IGBINARY:
                     $data = @igbinary_unserialize($data);
                     break;
             }
@@ -220,12 +224,12 @@ class Redis extends Base
 
         if (is_string($data) && $this->phpSerialize) {
             switch ($this->phpSerialize) {
-                case Marco::SERIALIZE_PHP:
+                case Macro::SERIALIZE_PHP:
                     if ($this->canUnserialize($data)) {
                         $data = unserialize($data);
                     }
                     break;
-                case Marco::SERIALIZE_IGBINARY:
+                case Macro::SERIALIZE_IGBINARY:
                     $data = @igbinary_unserialize($data);
                     break;
             }
@@ -245,7 +249,7 @@ class Redis extends Base
      */
     public function __unsleep()
     {
-        return ['context', 'redisAsynPool'];
+        return ['redisAsynPool'];
     }
 
     /**

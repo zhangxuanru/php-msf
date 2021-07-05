@@ -9,7 +9,6 @@
 namespace PG\MSF\Coroutine;
 
 use Exception;
-use PG\MSF\Helpers\Context;
 use PG\MSF\Controllers\Controller;
 use PG\AOP\MI;
 
@@ -43,14 +42,9 @@ class Task
     protected $controller;
 
     /**
-     * @var string 任务ID
+     * @var int 任务ID
      */
     protected $id;
-
-    /**
-     * @var \Throwable 迭代过程中的异常
-     */
-    protected $exception;
 
     /**
      * @var callable|null 迭代完成时执行回调函数
@@ -61,17 +55,15 @@ class Task
      * 初始化方法
      *
      * @param \Generator $routine 待调度的迭代器实例
-     * @param Context $context 请求的上下文对象
      * @param Controller $controller 当前请求控制器名称
      * @param $callBack callable|null 迭代器执行完成后回调函数
      */
-    public function __construct(\Generator $routine, Context &$context, Controller &$controller, callable $callBack = null)
+    public function __construct(\Generator $routine, Controller &$controller, callable $callBack = null)
     {
         $this->routine    = $routine;
-        $this->context    = $context;
         $this->controller = $controller;
         $this->stack      = new \SplStack();
-        $this->id         = $context->getLogId();
+        $this->id         = $this->getContext()->getRequestId();
         $this->callBack   = $callBack;
     }
 
@@ -122,23 +114,13 @@ class Task
     }
 
     /**
-     * 设置调度时产生的异常
-     *
-     * @param \Throwable $exception 异常实例
-     */
-    public function setException(\Throwable $exception)
-    {
-        $this->exception = $exception;
-    }
-
-    /**
      * 请求的协程调度
      */
     public function run()
     {
         try {
-            if ($this->exception) {
-                throw $this->exception;
+            if (!$this->routine) {
+                return;
             }
 
             $value = $this->routine->current();
@@ -196,20 +178,11 @@ class Task
                 }
             }
         } catch (\Throwable $e) {
-            $this->exception = null;
             if (empty($value)) {
                 $value = '';
             }
-            $runTaskException = $this->handleTaskException($e, $value);
 
-            if ($runTaskException instanceof \Throwable) {
-                if ($this->controller) {
-                    $this->controller->onExceptionHandle($runTaskException);
-                } else {
-                    $this->routine->throw($runTaskException);
-                }
-            }
-
+            $this->handleTaskException($e, $value);
             unset($value);
         }
     }
@@ -233,10 +206,6 @@ class Task
 
         $this->getContext()->getLog()->warning($message);
 
-        if (!empty($value) && $value instanceof IBase && method_exists($value, 'destroy')) {
-            $value->destroy();
-        }
-
         return $e;
     }
 
@@ -246,24 +215,45 @@ class Task
      * @param \Throwable $e 异常实例
      * @param mixed $value 当前迭代的值
      * @return bool|Exception|\Throwable
+     * @throws \Throwable
      */
-    public function handleTaskException(\Throwable $e, $value)
+    public function handleTaskException(\Throwable $userException, $value)
     {
-        while (!empty($this->stack) && !$this->stack->isEmpty()) {
-            $this->routine = $this->stack->pop();
-            try {
-                $this->routine->throw($e);
-                break;
-            } catch (\Exception $e) {
+        try {
+            if (!empty($this->routine) && $this->routine instanceof \Generator) {
+                $this->routine->throw($userException);
             }
-        }
+        } catch (\Throwable $noCatchUserException) {
+            if ($this->stack->isEmpty()) {
+                try {
+                    throw $noCatchUserException;
+                } catch (\Throwable $noCatch) {
+                    if ($this->controller) {
+                        $this->controller->onExceptionHandle($noCatch);
+                    } else {
+                        throw $noCatch;
+                    }
+                }
 
-        if (!empty($value) && $value instanceof IBase && method_exists($value, 'destroy')) {
-            $value->destroy();
-        }
+                return true;
+            }
 
-        if (!empty($this->stack) && $this->stack->isEmpty()) {
-            return $e;
+            $noCatchException = null;
+            while (!$this->stack->isEmpty()) {
+                $this->routine = $this->stack->pop();
+                try {
+                    $this->routine->throw($noCatchUserException);
+                    break;
+                } catch (\Throwable $e) {
+                    if ($this->stack->isEmpty()) {
+                        $noCatchException = $noCatchUserException;
+                    }
+                }
+            }
+
+            if ($this->stack->isEmpty() && $noCatchException !== null && $this->controller) {
+                $this->controller->onExceptionHandle($noCatchException);
+            }
         }
 
         return true;

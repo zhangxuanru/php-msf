@@ -8,7 +8,7 @@
 
 namespace PG\MSF\Controllers;
 
-use PG\MSF\Marco;
+use PG\MSF\Macro;
 use PG\MSF\Client\Http\Client;
 
 /**
@@ -56,7 +56,7 @@ class Bench extends Controller
         $cli->setHeaders([
             'Host' => 'localhost',
         ]);
-        $cli->get('/', function($client) {
+        $cli->get('/', function ($client) {
             $this->getContext()->getOutput()->end($client->body);
         });
     }

@@ -13,6 +13,7 @@ namespace PG\MSF\Process;
 
 use Noodlehaus\Config as Conf;
 use PG\MSF\MSFServer;
+use PG\MSF\Macro;
 
 /**
  * Class Timer
@@ -29,7 +30,7 @@ class Timer extends ProcessBase
     public function __construct(Conf $config, MSFServer $MSFServer)
     {
         parent::__construct($config, $MSFServer);
+        $this->MSFServer->processType = Macro::PROCESS_TIMER;
         writeln('User      Timer: Enabled');
-        $MSFServer->onInitTimer();
     }
 }

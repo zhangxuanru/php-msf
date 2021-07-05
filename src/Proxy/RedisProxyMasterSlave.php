@@ -8,7 +8,6 @@
 
 namespace PG\MSF\Proxy;
 
-use Exception;
 use PG\MSF\Pools\RedisAsynPool;
 
 /**
@@ -81,7 +80,7 @@ class RedisProxyMasterSlave implements IProxy
                 throw new Exception('No slave redis server in master-slave config!');
             }
         } catch (Exception $e) {
-            writeln('Redis Proxy' . $e->getMessage());
+            writeln('Redis Proxy ' . $e->getMessage());
         }
     }
 
